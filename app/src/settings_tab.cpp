@@ -15,6 +15,9 @@
 #include "button_selecting_dialog.hpp"
 #include "mapping_layout_editor.hpp"
 #include "UpscalingSupport.hpp"
+#if defined(__SWITCH__) && defined(MOONLIGHT_WIREGUARD)
+#include "vpn/WireGuardManager.hpp"
+#endif
 #include <cmath>
 #include <iomanip>
 #include <sstream>
@@ -63,6 +66,13 @@ std::string getDitheringStrengthText(float strength) {
 std::string getRcasStrengthText(float strength) {
     return std::to_string(int(strength * 100.0f)) + "%";
 }
+
+#if defined(__SWITCH__) && defined(MOONLIGHT_WIREGUARD)
+void saveWireGuardSettingsAndNotify() {
+    Settings::instance().save();
+    showAlert("settings/wireguard/restart_notice"_i18n);
+}
+#endif
 }
 
 #if defined(__SWITCH__)
@@ -384,6 +394,52 @@ SettingsTab::SettingsTab() {
     pcAudio->init(
         "settings/paop"_i18n, Settings::instance().play_audio(),
         [](bool value) { Settings::instance().set_play_audio(value); });
+
+#if defined(__SWITCH__) && defined(MOONLIGHT_WIREGUARD)
+    wireguardEnabled->init(
+        "settings/wireguard/enabled"_i18n,
+        Settings::instance().wireguard_enabled(), [](bool enabled) {
+            Settings::instance().set_wireguard_enabled(enabled);
+            saveWireGuardSettingsAndNotify();
+        });
+
+    wireguardConfigPath->init(
+        "settings/wireguard/config_path"_i18n,
+        Settings::instance().wireguard_config_path(), [](std::string path) {
+            auto& settings = Settings::instance();
+            if (path == settings.wireguard_config_path()) {
+                return;
+            }
+
+            settings.set_wireguard_config_path(path);
+            saveWireGuardSettingsAndNotify();
+        }, "", "settings/wireguard/config_path_hint"_i18n, 256);
+
+    wireguardTargetAddress->init(
+        "settings/wireguard/target_address"_i18n,
+        Settings::instance().wireguard_target_address(),
+        [](std::string address) {
+            auto& settings = Settings::instance();
+            if (address == settings.wireguard_target_address()) {
+                return;
+            }
+
+            settings.set_wireguard_target_address(address);
+            saveWireGuardSettingsAndNotify();
+        }, "192.168.1.100", "settings/wireguard/target_address_hint"_i18n,
+        15);
+
+    wireguardStatus->setText("settings/wireguard/status"_i18n);
+    wireguardStatus->setDetailText(
+        moonlight::vpn::WireGuardManager::instance().statusText());
+    wireguardStatus->registerClickAction([this](View* view) {
+        wireguardStatus->setDetailText(
+            moonlight::vpn::WireGuardManager::instance().statusText());
+        return true;
+    });
+#else
+    wireguardSection->removeFromSuperView(true);
+#endif
 
     swapUi->init("settings/swap_ui"_i18n, Settings::instance().swap_ui_keys(),
                  [](bool value) {

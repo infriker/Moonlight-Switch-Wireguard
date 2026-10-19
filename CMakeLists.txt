@@ -56,6 +56,7 @@ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${EXTERN_PATH}/cmake")
 # project info
 project(Moonlight)
 include(GNUInstallDirs)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/WireGuard.cmake")
 if (APPLE AND USE_SDL3)
     enable_language(OBJC)
 endif ()
@@ -208,6 +209,7 @@ file(GLOB MAIN_SRC CONFIGURE_DEPENDS
     app/src/streaming/ffmpeg/*.cpp
     app/src/streaming/switch/*.cpp
     app/src/views/*.cpp
+    app/src/vpn/*.cpp
     app/src/utils/*.cpp)
 
 if (MOONLIGHT_APPLE_MOBILE_USE_MULTI_SDK)
@@ -269,6 +271,7 @@ endif ()
 # building target
 program_target(${PROJECT_NAME} "${MAIN_SRC}")
 set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD 20)
+moonlight_add_wireguard_backend(${PROJECT_NAME})
 if (USE_SDL3)
     target_compile_definitions(${PROJECT_NAME} PRIVATE SDL_ENABLE_OLD_NAMES)
 endif ()
@@ -478,6 +481,7 @@ endif ()
 target_include_directories(${PROJECT_NAME} PUBLIC
         app/include
         app/include/gestures
+        app/src
         app/src/crypto
         app/src/gestures
         app/src/keyboards

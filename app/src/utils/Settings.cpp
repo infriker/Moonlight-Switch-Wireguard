@@ -79,6 +79,14 @@ void Settings::set_working_dir(const std::string& working_dir) {
     load();
 }
 
+std::string Settings::wireguard_config_path() const {
+    if (!m_wireguard_config_path.empty()) {
+        return m_wireguard_config_path;
+    }
+
+    return make_preferred_path(fs::path(m_working_dir) / "wg0.conf");
+}
+
 void Settings::add_host(const Host& host) {
     if (Host* existing = find_host(m_hosts, host)) {
         merge_host(*existing, host);
@@ -221,6 +229,27 @@ void Settings::load() {
         }
         
         if (json_t* settings = json_object_get(root, "settings")) {
+            if (json_t* wireguard_enabled =
+                    json_object_get(settings, "wireguard_enabled")) {
+                m_wireguard_enabled = json_typeof(wireguard_enabled) == JSON_TRUE;
+            }
+
+            if (json_t* wireguard_config_path =
+                    json_object_get(settings, "wireguard_config_path")) {
+                if (json_typeof(wireguard_config_path) == JSON_STRING) {
+                    m_wireguard_config_path =
+                        json_string_value(wireguard_config_path);
+                }
+            }
+
+            if (json_t* wireguard_target_address =
+                    json_object_get(settings, "wireguard_target_address")) {
+                if (json_typeof(wireguard_target_address) == JSON_STRING) {
+                    m_wireguard_target_address =
+                        json_string_value(wireguard_target_address);
+                }
+            }
+
             if (json_t* resolution = json_object_get(settings, "resolution")) {
                 if (json_typeof(resolution) == JSON_INTEGER) {
                     m_resolution = (int)json_integer_value(resolution);
@@ -531,6 +560,12 @@ void Settings::save() {
         }
         
         if (json_t* settings = json_object()) {
+            json_object_set_new(settings, "wireguard_enabled",
+                                m_wireguard_enabled ? json_true() : json_false());
+            json_object_set_new(settings, "wireguard_config_path",
+                                json_string(m_wireguard_config_path.c_str()));
+            json_object_set_new(settings, "wireguard_target_address",
+                                json_string(m_wireguard_target_address.c_str()));
             json_object_set_new(settings, "resolution", json_integer(m_resolution));
             json_object_set_new(settings, "native_resolution_scale", json_integer(m_native_resolution_scale));
             json_object_set_new(settings, "fps", json_integer(m_fps));

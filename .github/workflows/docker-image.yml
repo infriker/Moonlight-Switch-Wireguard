@@ -15,9 +15,14 @@ jobs:
 
     steps:
     - name: Check out repository
-      uses: actions/checkout@v1
+      uses: actions/checkout@v4
       with:
         submodules: recursive
+
+    - name: Initialize WireGuard runtime dependencies
+      run: |
+        git submodule update --init --checkout extern/wg-nx
+        git -C extern/wg-nx submodule update --init library/lwip
 
     - name: Remove useless fonts
       run: rm -rf ./resources/font
@@ -42,13 +47,13 @@ jobs:
       run: mv build/switch/Moonlight.nro build/switch/Moonlight-Switch.nro
 
     - name: Upload Moonlight-Switch.nro
-      uses: actions/upload-artifact@master
+      uses: actions/upload-artifact@v4
       with:
         name: Moonlight-Switch.nro
         path: build/switch/Moonlight-Switch.nro
 
     - name: Upload Moonlight-Switch.elf
-      uses: actions/upload-artifact@master
+      uses: actions/upload-artifact@v4
       with:
         name: Debug.elf
         path: build/switch/Moonlight.elf

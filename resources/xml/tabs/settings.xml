@@ -85,6 +85,32 @@
             
             <brls:BooleanCell
                 id="pcAudio"/>
+
+            <brls:Box
+                id="wireguard_section"
+                width="auto"
+                height="auto"
+                axis="column"
+                alignItems="stretch">
+
+                <brls:Header
+                    title="@i18n/settings/wireguard/title"
+                    subtitle="@i18n/settings/wireguard/help"
+                    paddingTop="60"
+                    lineTop="1px"/>
+
+                <brls:BooleanCell
+                    id="wireguard_enabled"/>
+
+                <brls:InputCell
+                    id="wireguard_config_path"/>
+
+                <brls:InputCell
+                    id="wireguard_target_address"/>
+
+                <brls:DetailCell
+                    id="wireguard_status"/>
+            </brls:Box>
                 
             <brls:BooleanCell
                 id="volume_amplification"/>

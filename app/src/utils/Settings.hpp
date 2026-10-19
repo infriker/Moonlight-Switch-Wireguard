@@ -84,6 +84,21 @@ class Settings : public Singleton<Settings> {
 
     void set_working_dir(const std::string& working_dir);
 
+    [[nodiscard]] bool wireguard_enabled() const { return m_wireguard_enabled; }
+    void set_wireguard_enabled(bool enabled) { m_wireguard_enabled = enabled; }
+
+    [[nodiscard]] std::string wireguard_config_path() const;
+    void set_wireguard_config_path(const std::string& path) {
+        m_wireguard_config_path = path;
+    }
+
+    [[nodiscard]] std::string wireguard_target_address() const {
+        return m_wireguard_target_address;
+    }
+    void set_wireguard_target_address(const std::string& address) {
+        m_wireguard_target_address = address;
+    }
+
     [[nodiscard]] std::string launch_path() const { return m_launch_path; }
     void set_launch_path(const std::string& launch_path) { m_launch_path = launch_path; }
 
@@ -326,6 +341,9 @@ class Settings : public Singleton<Settings> {
 
   private:
     std::string m_working_dir;
+    bool m_wireguard_enabled = false;
+    std::string m_wireguard_config_path;
+    std::string m_wireguard_target_address;
     std::string m_launch_path;
     std::string m_key_dir;
     std::string m_boxart_dir;

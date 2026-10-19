@@ -171,6 +171,17 @@
         "video_bitrate": "Битрейт видео",
         "video_codec": "Видео кодек",
         "volume_amplification": "Разрешить усиление громкости",
+        "wireguard": {
+            "config_path": "Путь к конфигурации WireGuard",
+            "config_path_hint": "Путь к файлу WireGuard .conf",
+            "enabled": "Включить WireGuard для Moonlight",
+            "help": "Используйте профиль WireGuard для Moonlight. Добавьте компьютер вручную с тем же IPv4-адресом. Изменения вступят в силу после перезапуска приложения.",
+            "restart_notice": "Перезапустите Moonlight, чтобы применить это изменение WireGuard. Добавьте компьютер вручную, указав тот же IPv4-адрес.",
+            "status": "Состояние WireGuard (нажмите для обновления)",
+            "target_address": "IPv4-адрес компьютера за роутером",
+            "target_address_hint": "Введите IPv4-адрес компьютера, например 192.168.1.100",
+            "title": "WireGuard"
+        },
         "zero_threads": "0 (Не использовать потоки)"
     },
     "streaming": {

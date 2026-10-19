@@ -13,3 +13,8 @@
 [submodule "extern/mdns"]
 	path = extern/mdns
 	url = https://github.com/mjansson/mdns.git
+[submodule "extern/wg-nx"]
+	path = extern/wg-nx
+	url = https://github.com/xlanor/wg-nx.git
+	# Initialize explicitly without its unrelated tester dependencies.
+	update = none

@@ -2,6 +2,17 @@
 
 Moonlight-Switch is a port of [Moonlight Game Streaming Project](https://github.com/moonlight-stream "Moonlight Game Streaming Project") for Nintendo Switch.
 
+## WireGuard in this fork
+
+This fork adds an in-app IPv4 WireGuard client for reaching a home PC through
+a WireGuard router. Put your Switch peer profile on the SD card, configure its
+path and the PC address in Settings, enable WireGuard, and restart Moonlight.
+Pairing, game lists, video, audio and input use the tunnel; no additional
+Switch VPN sysmodule is required. The initial implementation supports one peer,
+one PC and standard GameStream ports. It needs validation on a real Switch.
+
+See [WireGuard setup, build and limitations](docs/WIREGUARD.md).
+
 ## Screenshots
 <details>
   <summary>Preview</summary>

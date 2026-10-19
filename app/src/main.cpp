@@ -35,6 +35,7 @@ unsigned int sceLibcHeapSize             = 24 * 1024 * 1024;
 
 #include "DiscoverManager.hpp"
 #include "MoonlightSession.hpp"
+#include "vpn/WireGuardManager.hpp"
 #include "SwitchMoonlightSessionDecoderAndRenderProvider.hpp"
 
 
@@ -137,6 +138,10 @@ int main(int argc, char* argv[]) {
     auto home = Application::getPlatform()->getHomeDirectory("Moonlight-Switch");
     Settings::instance().set_working_dir(home);
     Settings::instance().set_launch_path(argc > 0 ? argv[0] : "");
+    moonlight::vpn::WireGuardManager::instance().initialize(
+        Settings::instance().wireguard_enabled(),
+        Settings::instance().wireguard_config_path(),
+        Settings::instance().wireguard_target_address());
     brls::Logger::info("Working dir, {}", home);
 
     // Have the application register an action on every activity that will quit
@@ -187,6 +192,9 @@ int main(int argc, char* argv[]) {
     }
 
     // Exit
+    // The producer and relay must stop before libnx destroys the socket service.
+    LiStopConnection();
+    moonlight::vpn::WireGuardManager::instance().shutdown();
 #if defined(PLATFORM_TVOS)
     exit(0);
 #endif

@@ -1,0 +1,1115 @@
+diff --git a/lwip-relay/include/arch/cc.h b/lwip-relay/include/arch/cc.h
+index d5c6d71..769f356 100644
+--- a/lwip-relay/include/arch/cc.h
++++ b/lwip-relay/include/arch/cc.h
+@@ -14,7 +14,9 @@
+ #include <arpa/inet.h>
+ 
+ #define LWIP_NO_STDINT_H 0
++#ifndef SSIZE_MAX
+ #define SSIZE_MAX INT_MAX
++#endif
+ 
+ typedef uint8_t  u8_t;
+ typedef int8_t   s8_t;
+diff --git a/lwip-relay/include/wg_lwip_relay.hpp b/lwip-relay/include/wg_lwip_relay.hpp
+index ea7fc7d..b9e04b6 100644
+--- a/lwip-relay/include/wg_lwip_relay.hpp
++++ b/lwip-relay/include/wg_lwip_relay.hpp
+@@ -70,11 +70,21 @@ private:
+         struct tcp_pcb* pcb;
+         uint16_t localPort;
+         uint16_t targetPort;
++        /* Bytes consumed from the local socket but not yet accepted by lwIP. */
+         std::vector<uint8_t> pendingData;
++        size_t pendingDataOffset = 0;
++        /* Bytes received from lwIP but not yet written to the local socket. */
++        std::vector<uint8_t> pendingLocalData;
++        size_t pendingLocalDataOffset = 0;
++        bool localEof = false;
++        bool remoteEof = false;
++        bool localWriteShutdown = false;
++        bool remoteWriteShutdown = false;
+         bool connected;
+     };
+ 
+     struct UdpBinding {
++        LwipRelay* relay;
+         int localSock;
+         struct udp_pcb* pcb;
+         uint16_t localPort;
+@@ -100,6 +110,7 @@ private:
+     static err_t onTcpRecv(void* arg, struct tcp_pcb* pcb, struct pbuf* p, err_t err);
+     static err_t onTcpSent(void* arg, struct tcp_pcb* pcb, u16_t len);
+     static void onTcpError(void* arg, err_t err);
++    static err_t flushPendingTcpToRemote(TcpConnection* conn, struct tcp_pcb* pcb);
+ 
+     static void onUdpRecv(void* arg, struct udp_pcb* pcb, struct pbuf* p,
+                           const ip_addr_t* addr, u16_t port);
+@@ -118,6 +129,7 @@ private:
+     std::mutex mutex_;
+ 
+     std::map<uint16_t, int> tcpListeners_;
++    std::map<uint16_t, uint16_t> tcpTargetPorts_;
+     std::map<int, std::shared_ptr<TcpConnection>> tcpConnections_;
+     std::map<uint16_t, std::shared_ptr<UdpBinding>> udpBindings_;
+ 
+diff --git a/lwip-relay/src/wg_lwip_relay.cpp b/lwip-relay/src/wg_lwip_relay.cpp
+index fc0324a..a2a21fd 100644
+--- a/lwip-relay/src/wg_lwip_relay.cpp
++++ b/lwip-relay/src/wg_lwip_relay.cpp
+@@ -15,6 +15,7 @@
+ #include <errno.h>
+ #include <climits>
+ #include <chrono>
++#include <new>
+ 
+ extern "C" {
+ #include "lwip/init.h"
+@@ -196,6 +197,7 @@ void LwipRelay::stop() {
+         close(pair.second);
+     }
+     tcpListeners_.clear();
++    tcpTargetPorts_.clear();
+ 
+     for (auto& pair : tcpConnections_) {
+         if (pair.second->localSock >= 0) {
+@@ -229,8 +231,12 @@ void LwipRelay::stop() {
+ uint16_t LwipRelay::startTcpRelay(uint16_t targetPort, uint16_t localPort) {
+     std::lock_guard<std::mutex> lock(mutex_);
+ 
+-    if (tcpListeners_.find(localPort) != tcpListeners_.end()) {
+-        return localPort;
++    auto existing = tcpListeners_.find(localPort);
++    if (existing != tcpListeners_.end()) {
++        auto target = tcpTargetPorts_.find(localPort);
++        return target != tcpTargetPorts_.end() && target->second == targetPort
++            ? localPort
++            : 0;
+     }
+ 
+     int sock = createTcpListener(localPort);
+@@ -239,6 +245,7 @@ uint16_t LwipRelay::startTcpRelay(uint16_t targetPort, uint16_t localPort) {
+     }
+ 
+     tcpListeners_[localPort] = sock;
++    tcpTargetPorts_[localPort] = targetPort;
+     log(LogLevel::Info, "LwipRelay: TCP listener on port %u -> %u", localPort, targetPort);
+     signalWake();
+     return localPort;
+@@ -273,6 +280,7 @@ uint16_t LwipRelay::startUdpRelay(uint16_t targetPort, uint16_t localPort) {
+     }
+ 
+     auto binding = std::make_shared<UdpBinding>();
++    binding->relay = this;
+     binding->localSock = sock;
+     binding->pcb = pcb;
+     binding->localPort = localPort;
+@@ -356,6 +364,7 @@ void LwipRelay::runLoop() {
+     while (running_) {
+         pollFds_.clear();
+         pollFds_.push_back({wakeFd_[0], POLLIN, 0});
++        bool retryPendingTcp = false;
+ 
+         {
+             std::lock_guard<std::mutex> lock(mutex_);
+@@ -363,8 +372,22 @@ void LwipRelay::runLoop() {
+                 pollFds_.push_back({pair.second, POLLIN, 0});
+             }
+             for (auto& pair : tcpConnections_) {
+-                if (pair.second->connected && pair.second->localSock >= 0) {
+-                    pollFds_.push_back({pair.first, POLLIN, 0});
++                if (pair.second->pendingDataOffset < pair.second->pendingData.size()) {
++                    retryPendingTcp = true;
++                }
++                if (pair.second->connected && pair.second->localSock >= 0 &&
++                    (!pair.second->localEof ||
++                     pair.second->pendingLocalDataOffset <
++                         pair.second->pendingLocalData.size())) {
++                    short events = 0;
++                    if (!pair.second->localEof && pair.second->pendingData.empty()) {
++                        events |= POLLIN;
++                    }
++                    if (pair.second->pendingLocalDataOffset <
++                        pair.second->pendingLocalData.size()) {
++                        events |= POLLOUT;
++                    }
++                    pollFds_.push_back({pair.first, events, 0});
+                 }
+             }
+             for (auto& pair : udpBindings_) {
+@@ -378,6 +401,9 @@ void LwipRelay::runLoop() {
+         int timeoutMs = sleepMs == SYS_TIMEOUTS_SLEEPTIME_INFINITE
+             ? -1
+             : static_cast<int>(std::min<u32_t>(sleepMs, INT_MAX));
++        if (retryPendingTcp && (timeoutMs < 0 || timeoutMs > 10)) {
++            timeoutMs = 10;
++        }
+ 
+         int ready = poll(pollFds_.data(), pollFds_.size(), timeoutMs);
+ 
+@@ -471,7 +497,7 @@ void LwipRelay::pollTcpListeners() {
+         conn->localSock = clientSock;
+         conn->pcb = pcb;
+         conn->localPort = localPort;
+-        conn->targetPort = localPort;
++        conn->targetPort = tcpTargetPorts_[localPort];
+         conn->connected = false;
+ 
+         tcp_arg(pcb, conn.get());
+@@ -482,9 +508,9 @@ void LwipRelay::pollTcpListeners() {
+         ip_addr_t destAddr;
+         ip_addr_copy_from_ip4(destAddr, targetAddr_);
+ 
+-        log(LogLevel::Info, "LwipRelay: new TCP connection, connecting to target port %u", localPort);
++        log(LogLevel::Info, "LwipRelay: new TCP connection, connecting to target port %u", conn->targetPort);
+ 
+-        err_t err = tcp_connect(pcb, &destAddr, localPort, onTcpConnected);
++        err_t err = tcp_connect(pcb, &destAddr, conn->targetPort, onTcpConnected);
+         if (err != ERR_OK) {
+             log(LogLevel::Error, "LwipRelay: tcp_connect failed: %d", (int)err);
+             close(clientSock);
+@@ -499,6 +525,7 @@ void LwipRelay::pollTcpListeners() {
+         if (it != tcpListeners_.end()) {
+             close(it->second);
+             tcpListeners_.erase(it);
++            tcpTargetPorts_.erase(port);
+         }
+     }
+ }
+@@ -510,50 +537,129 @@ void LwipRelay::pollTcpConnections() {
+         int sock = pair.first;
+         auto& conn = pair.second;
+ 
+-        /* lwIP callbacks mark remotely closed connections this way. Remove
+-         * them before their stale map key can enter the next poll set. */
+         if (conn->localSock < 0) {
+             toRemove.push_back(sock);
+             continue;
+         }
+ 
+-        if (!conn->connected) {
+-            continue;
++        short revents = pollRevents(sock);
++        bool failed = (revents & (POLLERR | POLLNVAL)) != 0;
++
++        if (conn->connected && conn->pcb) {
++            err_t err = flushPendingTcpToRemote(conn.get(), conn->pcb);
++            if (err != ERR_OK && err != ERR_MEM) {
++                log(LogLevel::Error, "LwipRelay: tcp_write/shutdown failed: %d", (int)err);
++                failed = true;
++            }
+         }
+ 
+-        short revents = pollRevents(sock);
++        /* Keep bytes until the local socket accepts them. A single send() can
++         * be partial or return EAGAIN even when poll reported POLLOUT. */
++        while (!failed && conn->pendingLocalDataOffset < conn->pendingLocalData.size()) {
++            size_t remaining = conn->pendingLocalData.size() - conn->pendingLocalDataOffset;
++            size_t chunk = std::min<size_t>(remaining, 4096);
++            ssize_t sent = send(conn->localSock,
++                                conn->pendingLocalData.data() + conn->pendingLocalDataOffset,
++                                chunk, 0);
++            if (sent > 0) {
++                conn->pendingLocalDataOffset += static_cast<size_t>(sent);
++                if (conn->pcb) tcp_recved(conn->pcb, static_cast<u16_t>(sent));
++                continue;
++            }
++            if (sent < 0 && errno == EINTR) continue;
++            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
++            failed = true;
++        }
++
++        if (conn->pendingLocalDataOffset == conn->pendingLocalData.size()) {
++            conn->pendingLocalData.clear();
++            conn->pendingLocalDataOffset = 0;
++        }
++
++        if (!failed && conn->remoteEof && !conn->remoteWriteShutdown &&
++            conn->pendingLocalData.empty()) {
++            if (shutdown(conn->localSock, SHUT_WR) == 0 || errno == ENOTCONN) {
++                conn->remoteWriteShutdown = true;
++            } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
++                failed = true;
++            }
++        }
+ 
+-        if (revents & POLLIN) {
++        if (!failed && conn->connected && conn->pcb && !conn->localEof &&
++            conn->pendingData.empty() && (revents & (POLLIN | POLLHUP))) {
+             uint8_t buf[2048];
+             ssize_t received = recv(sock, buf, sizeof(buf), 0);
+ 
+-            if (received <= 0) {
+-                if (received == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+-                    log(LogLevel::Info, "LwipRelay: local socket closed");
+-                    if (conn->pcb) {
+-                        tcp_close(conn->pcb);
+-                        conn->pcb = nullptr;
++            if (received > 0) {
++                try {
++                    conn->pendingData.assign(buf, buf + received);
++                } catch (const std::bad_alloc&) {
++                    failed = true;
++                }
++                if (!failed) {
++                    err_t err = flushPendingTcpToRemote(conn.get(), conn->pcb);
++                    if (err != ERR_OK && err != ERR_MEM) {
++                        log(LogLevel::Error, "LwipRelay: tcp_write failed: %d", (int)err);
++                        failed = true;
+                     }
+-                    toRemove.push_back(sock);
+                 }
+-                continue;
++                if (!failed && config_.debug_logging) {
++                    debugTcpPackets_++;
++                    debugTcpBytes_ += static_cast<uint64_t>(received);
++                }
++            } else if (received == 0) {
++                conn->localEof = true;
++                err_t err = flushPendingTcpToRemote(conn.get(), conn->pcb);
++                if (err != ERR_OK && err != ERR_MEM) failed = true;
++            } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
++                failed = true;
+             }
++        }
+ 
+-            if (conn->pcb) {
+-                err_t err = tcp_write(conn->pcb, buf, (u16_t)received, TCP_WRITE_FLAG_COPY);
+-                if (err == ERR_OK) {
+-                    tcp_output(conn->pcb);
+-                    if (config_.debug_logging) {
+-                        debugTcpPackets_++;
+-                        debugTcpBytes_ += static_cast<uint64_t>(received);
+-                    }
+-                } else {
+-                    log(LogLevel::Error, "LwipRelay: tcp_write failed: %d", (int)err);
+-                }
++        if (conn->connected && conn->pcb && conn->localEof && conn->remoteEof &&
++            conn->pendingData.empty() && conn->pendingLocalData.empty()) {
++            struct tcp_pcb* closingPcb = conn->pcb;
++
++            /* tcp_close() frees the PCB on success. Detach every callback first
++             * so lwIP cannot call into the TcpConnection after it is erased. */
++            tcp_arg(closingPcb, nullptr);
++            tcp_recv(closingPcb, nullptr);
++            tcp_sent(closingPcb, nullptr);
++            tcp_err(closingPcb, nullptr);
++
++            err_t err = tcp_close(closingPcb);
++            if (err == ERR_OK) {
++                conn->pcb = nullptr;
++                conn->connected = false;
++                close(conn->localSock);
++                conn->localSock = -1;
++                toRemove.push_back(sock);
++            } else if (err != ERR_MEM) {
++                tcp_arg(closingPcb, conn.get());
++                tcp_recv(closingPcb, onTcpRecv);
++                tcp_sent(closingPcb, onTcpSent);
++                tcp_err(closingPcb, onTcpError);
++                failed = true;
++            } else {
++                /* ERR_MEM leaves the PCB open; restore its callbacks and retry
++                 * the close after lwIP has reclaimed send-queue memory. */
++                tcp_arg(closingPcb, conn.get());
++                tcp_recv(closingPcb, onTcpRecv);
++                tcp_sent(closingPcb, onTcpSent);
++                tcp_err(closingPcb, onTcpError);
+             }
+         }
+ 
+-        if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
++        if (failed) {
++            if (conn->localSock >= 0) {
++                close(conn->localSock);
++                conn->localSock = -1;
++            }
++            if (conn->pcb) {
++                tcp_abort(conn->pcb);
++                conn->pcb = nullptr;
++            }
++            conn->connected = false;
+             toRemove.push_back(sock);
+         }
+     }
+@@ -573,6 +679,49 @@ void LwipRelay::pollTcpConnections() {
+     }
+ }
+ 
++err_t LwipRelay::flushPendingTcpToRemote(TcpConnection* conn, struct tcp_pcb* pcb) {
++    if (!conn || !pcb) return ERR_ARG;
++
++    bool wrote = false;
++    auto outputIfWritten = [&]() {
++        if (wrote) (void)tcp_output(pcb);
++    };
++    while (conn->pendingDataOffset < conn->pendingData.size()) {
++        u16_t available = tcp_sndbuf(pcb);
++        if (available == 0) {
++            outputIfWritten();
++            return ERR_MEM;
++        }
++
++        size_t remaining = conn->pendingData.size() - conn->pendingDataOffset;
++        u16_t chunk = static_cast<u16_t>(std::min<size_t>(remaining, available));
++        err_t err = tcp_write(pcb,
++                              conn->pendingData.data() + conn->pendingDataOffset,
++                              chunk, TCP_WRITE_FLAG_COPY);
++        if (err != ERR_OK) {
++            outputIfWritten();
++            return err;
++        }
++        conn->pendingDataOffset += chunk;
++        wrote = true;
++    }
++
++    if (conn->pendingDataOffset == conn->pendingData.size()) {
++        conn->pendingData.clear();
++        conn->pendingDataOffset = 0;
++    }
++
++    outputIfWritten();
++
++    if (conn->localEof && conn->pendingData.empty() && !conn->localWriteShutdown) {
++        err_t err = tcp_shutdown(pcb, 0, 1);
++        if (err != ERR_OK) return err;
++        conn->localWriteShutdown = true;
++    }
++
++    return ERR_OK;
++}
++
+ void LwipRelay::pollUdpSockets() {
+     std::vector<uint16_t> toRemove;
+ 
+@@ -610,17 +759,22 @@ void LwipRelay::pollUdpSockets() {
+             continue;
+         }
+ 
+-        memcpy(p->payload, buf, received);
++        if (pbuf_take(p, buf, static_cast<u16_t>(received)) != ERR_OK) {
++            pbuf_free(p);
++            continue;
++        }
+ 
+         ip_addr_t destAddr;
+         ip_addr_copy_from_ip4(destAddr, targetAddr_);
+ 
+-        udp_sendto(binding->pcb, p, &destAddr, binding->targetPort);
++        err_t err = udp_sendto(binding->pcb, p, &destAddr, binding->targetPort);
+         pbuf_free(p);
+ 
+-        if (config_.debug_logging) {
++        if (err == ERR_OK && config_.debug_logging) {
+             debugUdpPackets_++;
+             debugUdpBytes_ += static_cast<uint64_t>(received);
++        } else if (err != ERR_OK) {
++            log(LogLevel::Error, "LwipRelay: UDP send to target failed: %d", (int)err);
+         }
+     }
+ 
+@@ -717,28 +871,56 @@ err_t LwipRelay::onTcpRecv(void* arg, struct tcp_pcb* pcb, struct pbuf* p, err_t
+         return ERR_ARG;
+     }
+ 
+-    if (!p || err != ERR_OK) {
+-        if (conn->localSock >= 0) {
+-            close(conn->localSock);
+-            conn->localSock = -1;
+-        }
+-        conn->connected = false;
++    if (err != ERR_OK) {
++        if (p) pbuf_free(p);
++        return err;
++    }
++
++    if (!p) {
++        conn->remoteEof = true;
+         return ERR_OK;
+     }
+ 
+-    ssize_t sent = send(conn->localSock, p->payload, p->len, 0);
+-    (void)sent;
++    constexpr size_t kMaxPendingLocalBytes = 64 * 1024;
++    if (conn->pendingLocalDataOffset > 0) {
++        conn->pendingLocalData.erase(
++            conn->pendingLocalData.begin(),
++            conn->pendingLocalData.begin() + conn->pendingLocalDataOffset);
++        conn->pendingLocalDataOffset = 0;
++    }
++    if (p->tot_len > kMaxPendingLocalBytes - conn->pendingLocalData.size()) {
++        /* Leave ownership with lwIP. It will retry after tcp_recved opens the
++         * receive window, instead of dropping bytes from the TCP stream. */
++        return ERR_MEM;
++    }
++
++    size_t oldSize = conn->pendingLocalData.size();
++    try {
++        conn->pendingLocalData.resize(oldSize + p->tot_len);
++    } catch (const std::bad_alloc&) {
++        return ERR_MEM;
++    }
++    u16_t copied = pbuf_copy_partial(p,
++                                     conn->pendingLocalData.data() + oldSize,
++                                     p->tot_len, 0);
++    if (copied != p->tot_len) {
++        conn->pendingLocalData.resize(oldSize);
++        return ERR_MEM;
++    }
+ 
+-    tcp_recved(pcb, p->tot_len);
+     pbuf_free(p);
+ 
+     return ERR_OK;
+ }
+ 
+ err_t LwipRelay::onTcpSent(void* arg, struct tcp_pcb* pcb, u16_t len) {
+-    (void)arg;
+-    (void)pcb;
+     (void)len;
++    auto* conn = static_cast<TcpConnection*>(arg);
++    err_t err = flushPendingTcpToRemote(conn, pcb);
++    if (err != ERR_OK && err != ERR_MEM) {
++        tcp_abort(pcb);
++        return ERR_ABRT;
++    }
+     return ERR_OK;
+ }
+ 
+@@ -758,8 +940,6 @@ void LwipRelay::onTcpError(void* arg, err_t err) {
+ void LwipRelay::onUdpRecv(void* arg, struct udp_pcb* pcb, struct pbuf* p,
+                           const ip_addr_t* addr, u16_t port) {
+     (void)pcb;
+-    (void)addr;
+-    (void)port;
+ 
+     UdpBinding* binding = (UdpBinding*)arg;
+     if (!binding || !p) {
+@@ -772,9 +952,29 @@ void LwipRelay::onUdpRecv(void* arg, struct udp_pcb* pcb, struct pbuf* p,
+         return;
+     }
+ 
+-    ssize_t sent = sendto(binding->localSock, p->payload, p->len, 0,
+-                          (sockaddr*)&binding->clientAddr, sizeof(binding->clientAddr));
+-    (void)sent;
++    if (!binding->relay || !addr || !IP_IS_V4(addr) ||
++        !ip4_addr_cmp(ip_2_ip4(addr), &binding->relay->targetAddr_) ||
++        port != binding->targetPort) {
++        pbuf_free(p);
++        return;
++    }
++
++    uint8_t payload[WG_MAX_MTU];
++    if (p->tot_len > sizeof(payload)) {
++        pbuf_free(p);
++        return;
++    }
++    u16_t copied = pbuf_copy_partial(p, payload, p->tot_len, 0);
++    if (copied == p->tot_len) {
++        ssize_t sent = sendto(binding->localSock, payload, copied, 0,
++                              (sockaddr*)&binding->clientAddr, sizeof(binding->clientAddr));
++        if (sent != copied && binding->relay) {
++            binding->relay->log(LogLevel::Error,
++                                "LwipRelay: UDP send to local client failed");
++        }
++    } else if (binding->relay) {
++        binding->relay->log(LogLevel::Error, "LwipRelay: UDP pbuf copy was incomplete");
++    }
+ 
+     pbuf_free(p);
+ }
+diff --git a/src/wg_internal.h b/src/wg_internal.h
+index c184152..2fe7c37 100644
+--- a/src/wg_internal.h
++++ b/src/wg_internal.h
+@@ -142,8 +142,12 @@ struct WgTunnel {
+     WgThread recv_thread;
+     WgThread keepalive_thread;
+     WgStopCond stop_cond;
++    /* Serializes transport sends and all mutable session/rekey state. */
+     WgMutex send_mutex;
+     uint8_t send_buffer[2048];
++    /* Registration is mutex-protected. The owner must wg_stop() before
++     * destroying or replacing callback user data because callbacks run after
++     * the mutex is released. */
+     WgRecvCallback recv_cb;
+     void* recv_cb_user;
+     bool running;
+diff --git a/src/wg_noise.c b/src/wg_noise.c
+index ccb96cf..51bfd56 100644
+--- a/src/wg_noise.c
++++ b/src/wg_noise.c
+@@ -84,7 +84,9 @@ int wg_handshake_init(WgTunnel* tun, WgHandshakeInit* msg, WgHandshakeState* sta
+     msg->type = WG_MSG_HANDSHAKE_INIT;
+     memset(msg->reserved, 0, sizeof(msg->reserved));
+     msg->sender_index = wg_random_index();
+-    tun->session.old_local_index = tun->session.local_index;
++    tun->session.old_local_index = tun->session.valid
++        ? tun->session.local_index
++        : 0;
+     __atomic_store_n(&tun->session.local_index, msg->sender_index, __ATOMIC_RELEASE);
+     __atomic_store_n(&tun->session.rekey_in_progress, true, __ATOMIC_RELEASE);
+ 
+@@ -137,8 +139,6 @@ int wg_handshake_response(WgTunnel* tun, const WgHandshakeResponse* msg, WgHands
+     if (msg->receiver_index != tun->session.local_index)
+         return WG_ERR_HANDSHAKE;
+ 
+-    tun->session.remote_index = msg->sender_index;
+-
+     wg_mix_hash(state, msg->ephemeral, WG_KEY_LEN);
+     wg_kdf1(state->chaining_key, state->chaining_key, msg->ephemeral, WG_KEY_LEN);
+ 
+@@ -166,6 +166,9 @@ int wg_handshake_response(WgTunnel* tun, const WgHandshakeResponse* msg, WgHands
+         return WG_ERR_DECRYPT;
+     }
+ 
++    /* Do not let an unauthenticated response redirect transport packets. */
++    tun->session.remote_index = msg->sender_index;
++
+     wg_mix_hash(state, msg->encrypted_nothing, sizeof(msg->encrypted_nothing));
+ 
+     if (tun->session.valid) {
+diff --git a/src/wireguard.c b/src/wireguard.c
+index 931e256..060b421 100644
+--- a/src/wireguard.c
++++ b/src/wireguard.c
+@@ -66,6 +66,7 @@ void wg_recv_slot_release(WgTunnel* tun, WgRecvSlot* slot) {
+ 
+ #define WG_KEEPALIVE_DEFAULT 25
+ #define WG_REKEY_CHECK_INTERVAL_MS 10000
++#define WG_INITIAL_HANDSHAKE_ATTEMPTS 3
+ 
+ static int wg_jitter_ms(void) {
+     return (int)(wg_random_index() % 334);
+@@ -117,6 +118,8 @@ WgTunnel* wg_init(const WgConfig* config) {
+     }
+ 
+     if (wg_resolve_endpoint(tun, config->endpoint_host, config->endpoint_port) != WG_OK) {
++        crypto_wipe(tun->static_private, sizeof(tun->static_private));
++        crypto_wipe(tun->preshared_key, sizeof(tun->preshared_key));
+         free(tun);
+         return NULL;
+     }
+@@ -128,12 +131,16 @@ WgTunnel* wg_init(const WgConfig* config) {
+     tun->recv_cb_user = NULL;
+ 
+     if (wg_mutex_init(&tun->send_mutex, false) != 0) {
++        crypto_wipe(tun->static_private, sizeof(tun->static_private));
++        crypto_wipe(tun->preshared_key, sizeof(tun->preshared_key));
+         free(tun);
+         return NULL;
+     }
+ 
+     if (wg_stop_cond_init(&tun->stop_cond) != 0) {
+         wg_mutex_fini(&tun->send_mutex);
++        crypto_wipe(tun->static_private, sizeof(tun->static_private));
++        crypto_wipe(tun->preshared_key, sizeof(tun->preshared_key));
+         free(tun);
+         return NULL;
+     }
+@@ -141,6 +148,8 @@ WgTunnel* wg_init(const WgConfig* config) {
+     if (wg_recv_pool_init(&tun->recv_pool) != 0) {
+         wg_stop_cond_fini(&tun->stop_cond);
+         wg_mutex_fini(&tun->send_mutex);
++        crypto_wipe(tun->static_private, sizeof(tun->static_private));
++        crypto_wipe(tun->preshared_key, sizeof(tun->preshared_key));
+         free(tun);
+         return NULL;
+     }
+@@ -151,8 +160,10 @@ WgTunnel* wg_init(const WgConfig* config) {
+ void wg_set_recv_callback(WgTunnel* tun, WgRecvCallback cb, void* user) {
+     if (!tun)
+         return;
++    wg_mutex_lock(&tun->send_mutex);
+     tun->recv_cb = cb;
+     tun->recv_cb_user = user;
++    wg_mutex_unlock(&tun->send_mutex);
+ }
+ 
+ static void wg_send_keepalive(WgTunnel* tun) {
+@@ -186,7 +197,7 @@ int wg_connect(WgTunnel* tun) {
+     uint8_t recv_buf[256];
+ 
+     int err = WG_ERR_TIMEOUT;
+-    for (int attempt = 0; attempt < WG_MAX_TIMER_HANDSHAKES; attempt++) {
++    for (int attempt = 0; attempt < WG_INITIAL_HANDSHAKE_ATTEMPTS; attempt++) {
+         wg_log("connect: attempt %d", attempt + 1);
+ 
+         err = wg_handshake_init(tun, &init_msg, &state);
+@@ -233,6 +244,17 @@ int wg_connect(WgTunnel* tun) {
+             continue;
+         }
+ 
++        WgTransport* response_header = (WgTransport*)recv_buf;
++        if (response_header->type == WG_MSG_COOKIE_REPLY &&
++            (size_t)received >= sizeof(WgCookieReply)) {
++            if (wg_process_cookie_reply(tun, (const WgCookieReply*)recv_buf) == WG_OK) {
++                err = WG_ERR_TIMEOUT;
++                continue;
++            }
++            err = WG_ERR_HANDSHAKE;
++            continue;
++        }
++
+         if ((size_t)received < sizeof(WgHandshakeResponse)) {
+             err = WG_ERR_HANDSHAKE;
+             crypto_wipe(&state, sizeof(state));
+@@ -253,11 +275,15 @@ int wg_connect(WgTunnel* tun) {
+     crypto_wipe(&init_msg, sizeof(init_msg));
+ 
+     if (err != WG_OK) {
++        wg_mutex_lock(&tun->send_mutex);
+         tun->session.rekey_in_progress = false;
++        wg_mutex_unlock(&tun->send_mutex);
+         return err;
+     }
+ 
++    wg_mutex_lock(&tun->send_mutex);
+     wg_send_keepalive(tun);
++    wg_mutex_unlock(&tun->send_mutex);
+ 
+     return WG_OK;
+ }
+@@ -266,24 +292,37 @@ int wg_rekey(WgTunnel* tun) {
+     WgHandshakeInit init_msg;
+     WgHandshakeState state;
+ 
++    wg_mutex_lock(&tun->send_mutex);
+     uint32_t saved_local_index = tun->session.local_index;
++    uint32_t saved_old_local_index = tun->session.old_local_index;
+     tun->pending_response_len = 0;
++    tun->pending_cookie = false;
+ 
+     wg_log("rekey: starting (old_idx=%08x)", tun->session.local_index);
++    wg_mutex_unlock(&tun->send_mutex);
+ 
+     int err = WG_ERR_TIMEOUT;
+     for (int attempt = 0; attempt < WG_MAX_TIMER_HANDSHAKES; attempt++) {
++        uint8_t response_copy[sizeof(tun->pending_response)];
++        int response_len = 0;
++        bool received_cookie = false;
++
++        wg_mutex_lock(&tun->send_mutex);
+         tun->pending_response_len = 0;
+         tun->pending_cookie = false;
+ 
+         err = wg_handshake_init(tun, &init_msg, &state);
+         if (err != WG_OK) {
+             wg_log("rekey: init failed: %d", err);
++            wg_mutex_unlock(&tun->send_mutex);
+             break;
+         }
++        /* Keep the old active index across retries. wg_handshake_init advances
++         * local_index for each attempt, but packets from the established peer
++         * session still target the index saved before the first attempt. */
++        tun->session.old_local_index = saved_local_index;
+         wg_log("rekey: attempt %d new_idx=%08x", attempt + 1, tun->session.local_index);
+ 
+-        wg_mutex_lock(&tun->send_mutex);
+         int sent = wg_socket_send(tun, &init_msg, sizeof(init_msg));
+         wg_mutex_unlock(&tun->send_mutex);
+ 
+@@ -294,37 +333,56 @@ int wg_rekey(WgTunnel* tun) {
+ 
+         int64_t remaining_ms = (int64_t)WG_REKEY_TIMEOUT * 1000 + wg_jitter_ms();
+         while (remaining_ms > 0) {
+-            if (tun->pending_response_len > 0 || tun->pending_cookie)
++            wg_mutex_lock(&tun->send_mutex);
++            received_cookie = tun->pending_cookie;
++            response_len = tun->pending_response_len;
++            if (!received_cookie && response_len > 0 &&
++                (size_t)response_len <= sizeof(response_copy)) {
++                memcpy(response_copy, tun->pending_response, response_len);
++                tun->pending_response_len = 0;
++            }
++            wg_mutex_unlock(&tun->send_mutex);
++
++            if (received_cookie || response_len > 0)
+                 break;
++            if (wg_stop_cond_check(&tun->stop_cond)) {
++                remaining_ms = 0;
++                break;
++            }
+             wg_sleep_ms(10);
+             remaining_ms -= 10;
+         }
+ 
+-        if (tun->pending_cookie) {
++        if (received_cookie) {
+             wg_log("rekey: cookie received, retransmitting with mac2");
+-            tun->pending_cookie = false;
+             crypto_wipe(&state, sizeof(state));
+             crypto_wipe(&init_msg, sizeof(init_msg));
+             continue;
+         }
+ 
+-        if (tun->pending_response_len == 0) {
++        if (response_len == 0) {
+             wg_log("rekey: timeout attempt %d", attempt + 1);
+             err = WG_ERR_TIMEOUT;
+             crypto_wipe(&state, sizeof(state));
+             crypto_wipe(&init_msg, sizeof(init_msg));
++            if (wg_stop_cond_check(&tun->stop_cond)) break;
+             continue;
+         }
+ 
+-        if ((size_t)tun->pending_response_len < sizeof(WgHandshakeResponse)) {
++        if ((size_t)response_len < sizeof(WgHandshakeResponse) ||
++            (size_t)response_len > sizeof(response_copy)) {
+             err = WG_ERR_HANDSHAKE;
+             crypto_wipe(&state, sizeof(state));
+             crypto_wipe(&init_msg, sizeof(init_msg));
+             continue;
+         }
+ 
+-        WgHandshakeResponse* response = (WgHandshakeResponse*)tun->pending_response;
+-        err = wg_handshake_response(tun, response, &state);
++        wg_mutex_lock(&tun->send_mutex);
++        err = wg_handshake_response(tun,
++                                    (const WgHandshakeResponse*)response_copy,
++                                    &state);
++        wg_mutex_unlock(&tun->send_mutex);
++        crypto_wipe(response_copy, sizeof(response_copy));
+         if (err == WG_OK) {
+             wg_log("rekey: success");
+             break;
+@@ -338,8 +396,11 @@ int wg_rekey(WgTunnel* tun) {
+     crypto_wipe(&init_msg, sizeof(init_msg));
+ 
+     if (err != WG_OK) {
++        wg_mutex_lock(&tun->send_mutex);
+         tun->session.local_index = saved_local_index;
++        tun->session.old_local_index = saved_old_local_index;
+         tun->session.rekey_in_progress = false;
++        wg_mutex_unlock(&tun->send_mutex);
+         return err;
+     }
+ 
+@@ -397,7 +458,7 @@ static void* recv_thread_func(void* arg) {
+             if (received == WG_ERR_TIMEOUT) {
+                 uint64_t now = wg_time_now();
+                 if (now - last_log >= 5000000000ULL) {
+-                    wg_log("recv: total=%llu idx=%08x", (unsigned long long)total_recv, tun->session.local_index);
++                    wg_log("recv: total=%llu idx=%08x", (unsigned long long)total_recv, wg_get_session_index(tun));
+                     last_log = now;
+                 }
+                 continue;
+@@ -413,7 +474,7 @@ static void* recv_thread_func(void* arg) {
+         if ((total_recv & 127ULL) == 0) {
+             uint64_t now = wg_time_now();
+             if (now - last_log >= 5000000000ULL) {
+-                wg_log("recv: total=%llu idx=%08x", (unsigned long long)total_recv, tun->session.local_index);
++                wg_log("recv: total=%llu idx=%08x", (unsigned long long)total_recv, wg_get_session_index(tun));
+                 last_log = now;
+             }
+         }
+@@ -426,23 +487,32 @@ static void* recv_thread_func(void* arg) {
+ 
+         WgTransport* transport = (WgTransport*)packet;
+         if (transport->type != WG_MSG_TRANSPORT) {
+-            if (transport->type == WG_MSG_HANDSHAKE_RESPONSE && tun->session.rekey_in_progress) {
+-                wg_log("recv: handshake_response rekey=%d", tun->session.rekey_in_progress);
+-                if ((size_t)received <= sizeof(tun->pending_response)) {
++            if (transport->type == WG_MSG_HANDSHAKE_RESPONSE) {
++                wg_mutex_lock(&tun->send_mutex);
++                bool rekey_in_progress = tun->session.rekey_in_progress;
++                if (rekey_in_progress &&
++                    (size_t)received <= sizeof(tun->pending_response)) {
+                     memcpy(tun->pending_response, packet, received);
+                     tun->pending_response_len = received;
+-                    wg_log("recv: stored handshake response for rekey");
+                 }
++                wg_mutex_unlock(&tun->send_mutex);
++                if (rekey_in_progress) wg_log("recv: stored handshake response for rekey");
+             } else if (transport->type == WG_MSG_COOKIE_REPLY) {
+                 if ((size_t)received >= sizeof(WgCookieReply)) {
+-                    wg_process_cookie_reply(tun, (const WgCookieReply*)packet);
+-                    tun->pending_cookie = true;
++                    wg_mutex_lock(&tun->send_mutex);
++                    int cookie_result = wg_process_cookie_reply(
++                        tun, (const WgCookieReply*)packet);
++                    if (cookie_result == WG_OK) tun->pending_cookie = true;
++                    wg_mutex_unlock(&tun->send_mutex);
+                 }
+             } else if (transport->type == WG_MSG_HANDSHAKE_INIT) {
+-                if (!tun->session.rekey_in_progress) {
++                wg_mutex_lock(&tun->send_mutex);
++                bool start_rekey = !tun->session.rekey_in_progress;
++                if (start_rekey) {
+                     wg_log("recv: server-initiated handshake, triggering rekey");
+                     tun->session.rekey_in_progress = true; /* keepalive thread will pick it up */
+                 }
++                wg_mutex_unlock(&tun->send_mutex);
+             } else {
+                 wg_log("recv: not transport (type=%d)", transport->type);
+             }
+@@ -450,8 +520,8 @@ static void* recv_thread_func(void* arg) {
+             continue;
+         }
+ 
+-        uint32_t cur_idx = __atomic_load_n(&tun->session.local_index, __ATOMIC_ACQUIRE);
+-        __atomic_load_n(&tun->session.rekey_in_progress, __ATOMIC_ACQUIRE);
++        wg_mutex_lock(&tun->send_mutex);
++        uint32_t cur_idx = tun->session.local_index;
+         WgSession* sess = NULL;
+         if (transport->receiver_index == cur_idx) {
+             sess = &tun->session;
+@@ -465,6 +535,7 @@ static void* recv_thread_func(void* arg) {
+                    transport->receiver_index, cur_idx,
+                    tun->prev_session.valid, tun->prev_session.local_index,
+                    tun->session.old_local_index);
++            wg_mutex_unlock(&tun->send_mutex);
+             if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
+             continue;
+         }
+@@ -476,6 +547,7 @@ static void* recv_thread_func(void* arg) {
+                 crypto_wipe(&tun->prev_session, sizeof(tun->prev_session));
+                 tun->prev_session.valid = false;
+             }
++            wg_mutex_unlock(&tun->send_mutex);
+             if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
+             continue;
+         }
+@@ -483,21 +555,23 @@ static void* recv_thread_func(void* arg) {
+         size_t ciphertext_len = received - sizeof(WgTransport);
+         size_t plaintext_len = ciphertext_len - WG_AEAD_TAG_LEN;
+ 
+-        if (plaintext_len == 0) {
+-            sess->last_received = wg_time_now();
+-            if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
+-            continue;
+-        }
+-
+-        int err = wg_aead_decrypt(transport->encrypted_data, sess->receiving_key, transport->counter, transport->encrypted_data, ciphertext_len, NULL, 0);
++        uint8_t empty_plaintext;
++        uint8_t* plaintext = plaintext_len == 0
++            ? &empty_plaintext
++            : transport->encrypted_data;
++        int err = wg_aead_decrypt(plaintext, sess->receiving_key,
++                                  transport->counter, transport->encrypted_data,
++                                  ciphertext_len, NULL, 0);
+         if (err != 0) {
+             wg_log("recv: decrypt failed (ctr=%llu)", (unsigned long long)transport->counter);
++            wg_mutex_unlock(&tun->send_mutex);
+             if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
+             continue;
+         }
+ 
+         if (!wg_counter_validate(&sess->replay, transport->counter)) {
+             wg_log("recv: replay detected (ctr=%llu)", (unsigned long long)transport->counter);
++            wg_mutex_unlock(&tun->send_mutex);
+             if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
+             continue;
+         }
+@@ -505,15 +579,22 @@ static void* recv_thread_func(void* arg) {
+         sess->last_received = wg_time_now();
+         sess->receiving_counter = transport->counter + 1;
+ 
+-        wg_mutex_lock(&tun->send_mutex);
+         wg_update_endpoint_from_recv(tun);
++        WgRecvCallback recv_cb = tun->recv_cb;
++        void* recv_cb_user = tun->recv_cb_user;
+         wg_mutex_unlock(&tun->send_mutex);
+ 
++        if (plaintext_len == 0) {
++            if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
++            continue;
++        }
++
+         /* Hand plaintext to the consumer. If pool was exhausted (slot == NULL)
+          * or the consumer did not claim ownership, we drop the packet (for
+          * transport data — handshake/rekey state has already been mutated). */
+-        if (tun->recv_cb && slot) {
+-            int retained = tun->recv_cb(tun->recv_cb_user, slot, transport->encrypted_data, plaintext_len);
++        if (recv_cb && slot) {
++            int retained = recv_cb(recv_cb_user, slot,
++                                   transport->encrypted_data, plaintext_len);
+             if (!retained) wg_recv_pool_release(&tun->recv_pool, slot);
+         } else if (slot) {
+             wg_recv_pool_release(&tun->recv_pool, slot);
+@@ -545,47 +626,55 @@ static void* keepalive_thread_func(void* arg) {
+ 
+         uint64_t now = wg_time_now();
+ 
+-        if (tun->session.valid &&
+-            (now - tun->session.last_handshake) >= WG_ZERO_KEY_TIMEOUT_NS) {
++        wg_mutex_lock(&tun->send_mutex);
++        bool zero_expired = tun->session.valid &&
++            (now - tun->session.last_handshake) >= WG_ZERO_KEY_TIMEOUT_NS;
++        if (zero_expired) {
+             wg_log("keepalive: session keys exceeded REJECT_AFTER_TIME×3, zeroing");
+             crypto_wipe(&tun->session, sizeof(tun->session));
+             tun->session.valid = false;
+             crypto_wipe(&tun->prev_session, sizeof(tun->prev_session));
+             tun->prev_session.valid = false;
++        }
++
++        bool session_valid = tun->session.valid;
++        bool dead_peer = session_valid && tun->session.last_received > 0 &&
++            (now - tun->session.last_received) >= WG_DEAD_PEER_TIMEOUT_NS &&
++            !tun->session.rekey_in_progress;
++        bool needs_rekey = wg_needs_rekey(tun);
++        bool server_triggered = session_valid && tun->session.rekey_in_progress &&
++            !needs_rekey;
++        bool send_keepalive = session_valid &&
++            ((tun->session.last_received > 0 &&
++              (now - tun->last_sent) >= WG_KEEPALIVE_TIMEOUT_NS) ||
++             (tun->keepalive_interval > 0 &&
++              (now - last_keepalive) >=
++                  (uint64_t)tun->keepalive_interval * 1000000000ULL));
++        wg_mutex_unlock(&tun->send_mutex);
++
++        if (zero_expired) {
+             continue;
+         }
+ 
+-        if (!tun->session.valid)
++        if (!session_valid)
+             continue;
+ 
+-        if (tun->session.last_received > 0 &&
+-            (now - tun->session.last_received) >= WG_DEAD_PEER_TIMEOUT_NS &&
+-            !tun->session.rekey_in_progress) {
++        if (dead_peer) {
+             wg_log("keepalive: dead peer detected, rekeying");
+             wg_rekey(tun);
+             last_keepalive = wg_time_now();
+             continue;
+         }
+ 
+-        bool server_triggered = tun->session.rekey_in_progress && !wg_needs_rekey(tun);
+-        if (wg_needs_rekey(tun) || server_triggered) {
++        if (needs_rekey || server_triggered) {
+             wg_rekey(tun);
+             last_keepalive = wg_time_now();
+             continue;
+         }
+ 
+-        if (tun->session.last_received > 0 &&
+-            (now - tun->last_sent) >= WG_KEEPALIVE_TIMEOUT_NS) {
++        if (send_keepalive) {
+             wg_mutex_lock(&tun->send_mutex);
+-            wg_send_keepalive(tun);
+-            wg_mutex_unlock(&tun->send_mutex);
+-            last_keepalive = now;
+-            continue;
+-        }
+-
+-        if (tun->keepalive_interval > 0 && (now - last_keepalive) >= (uint64_t)tun->keepalive_interval * 1000000000ULL) {
+-            wg_mutex_lock(&tun->send_mutex);
+-            wg_send_keepalive(tun);
++            if (tun->session.valid) wg_send_keepalive(tun);
+             wg_mutex_unlock(&tun->send_mutex);
+             last_keepalive = now;
+         }
+@@ -632,21 +721,23 @@ void wg_stop(WgTunnel* tun) {
+ }
+ 
+ int wg_send(WgTunnel* tun, const void* data, size_t len) {
+-    if (!tun || !tun->session.valid)
++    if (!tun)
+         return WG_ERR_NOT_CONNECTED;
+ 
+     if (len > tun->mtu)
+         return WG_ERR_BUFFER_TOO_SMALL;
+ 
+-    if (wg_session_expired(tun))
+-        return WG_ERR_NOT_CONNECTED;
+-
+     size_t packet_size = sizeof(WgTransport) + len + WG_AEAD_TAG_LEN;
+     if (packet_size > WG_MAX_PACKET_SIZE)
+         return WG_ERR_BUFFER_TOO_SMALL;
+ 
+     wg_mutex_lock(&tun->send_mutex);
+ 
++    if (!tun->session.valid || wg_session_expired(tun)) {
++        wg_mutex_unlock(&tun->send_mutex);
++        return WG_ERR_NOT_CONNECTED;
++    }
++
+     uint8_t* packet = tun->send_buffer;
+     WgTransport* transport = (WgTransport*)packet;
+     transport->type = WG_MSG_TRANSPORT;
+@@ -669,9 +760,14 @@ int wg_send(WgTunnel* tun, const void* data, size_t len) {
+ }
+ 
+ int wg_recv(WgTunnel* tun, void* buf, size_t len, int timeout_ms) {
+-    if (!tun || !tun->session.valid)
++    if (!tun)
+         return WG_ERR_NOT_CONNECTED;
+ 
++    wg_mutex_lock(&tun->send_mutex);
++    bool session_valid = tun->session.valid;
++    wg_mutex_unlock(&tun->send_mutex);
++    if (!session_valid) return WG_ERR_NOT_CONNECTED;
++
+     uint8_t packet[WG_MAX_PACKET_SIZE];
+ 
+     int received = wg_socket_recv(tun, packet, WG_MAX_PACKET_SIZE, timeout_ms);
+@@ -686,29 +782,44 @@ int wg_recv(WgTunnel* tun, void* buf, size_t len, int timeout_ms) {
+     if (transport->type != WG_MSG_TRANSPORT)
+         return WG_ERR_DECRYPT;
+ 
++    wg_mutex_lock(&tun->send_mutex);
++    if (!tun->session.valid) {
++        wg_mutex_unlock(&tun->send_mutex);
++        return WG_ERR_NOT_CONNECTED;
++    }
++
+     if (transport->receiver_index != tun->session.local_index)
++    {
++        wg_mutex_unlock(&tun->send_mutex);
+         return WG_ERR_DECRYPT;
++    }
+ 
+     size_t ciphertext_len = received - sizeof(WgTransport);
+     size_t plaintext_len = ciphertext_len - WG_AEAD_TAG_LEN;
+ 
+-    if (plaintext_len > len)
++    if (plaintext_len > len) {
++        wg_mutex_unlock(&tun->send_mutex);
+         return WG_ERR_BUFFER_TOO_SMALL;
+-
+-    if (plaintext_len == 0) {
+-        tun->session.last_received = wg_time_now();
+-        return 0;
+     }
+ 
+-    int err = wg_aead_decrypt(buf, tun->session.receiving_key, transport->counter, transport->encrypted_data, ciphertext_len, NULL, 0);
+-    if (err != 0)
++    uint8_t empty_plaintext;
++    void* plaintext = plaintext_len == 0 ? &empty_plaintext : buf;
++    int err = wg_aead_decrypt(plaintext, tun->session.receiving_key,
++                              transport->counter, transport->encrypted_data,
++                              ciphertext_len, NULL, 0);
++    if (err != 0) {
++        wg_mutex_unlock(&tun->send_mutex);
+         return WG_ERR_DECRYPT;
++    }
+ 
+-    if (!wg_counter_validate(&tun->session.replay, transport->counter))
++    if (!wg_counter_validate(&tun->session.replay, transport->counter)) {
++        wg_mutex_unlock(&tun->send_mutex);
+         return WG_ERR_DECRYPT;
++    }
+ 
+     tun->session.last_received = wg_time_now();
+     tun->session.receiving_counter = transport->counter + 1;
++    wg_mutex_unlock(&tun->send_mutex);
+ 
+     return (int)plaintext_len;
+ }
+@@ -794,7 +905,10 @@ int wg_key_to_base64(char* base64, size_t len, const uint8_t key[WG_KEY_LEN]) {
+ }
+ 
+ uint32_t wg_get_session_index(WgTunnel* tun) {
+-    if (!tun || !tun->session.valid)
++    if (!tun)
+         return 0;
+-    return tun->session.local_index;
++    wg_mutex_lock(&tun->send_mutex);
++    uint32_t index = tun->session.valid ? tun->session.local_index : 0;
++    wg_mutex_unlock(&tun->send_mutex);
++    return index;
+ }

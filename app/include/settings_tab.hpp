@@ -56,6 +56,11 @@ class SettingsTab : public brls::Box {
     BRLS_BIND(brls::Header, mouseSpeedHeader, "mouse_speed_header");
     BRLS_BIND(brls::Slider, mouseSpeedSlider, "mouse_speed_slider");
     BRLS_BIND(brls::BooleanCell, writeLog, "writeLog");
+    BRLS_BIND(brls::Box, wireguardSection, "wireguard_section");
+    BRLS_BIND(brls::BooleanCell, wireguardEnabled, "wireguard_enabled");
+    BRLS_BIND(brls::InputCell, wireguardConfigPath, "wireguard_config_path");
+    BRLS_BIND(brls::InputCell, wireguardTargetAddress, "wireguard_target_address");
+    BRLS_BIND(brls::DetailCell, wireguardStatus, "wireguard_status");
 
     static brls::View* create();
 

@@ -171,6 +171,17 @@
         "video_bitrate": "Video bitrate",
         "video_codec": "Video codec",
         "volume_amplification": "Allow volume amplification",
+        "wireguard": {
+            "config_path": "WireGuard configuration path",
+            "config_path_hint": "Path to the WireGuard .conf file",
+            "enabled": "Enable WireGuard for Moonlight",
+            "help": "Use a WireGuard profile for Moonlight. Add your PC manually with the same IPv4 address. Changes apply after restarting the app.",
+            "restart_notice": "Restart Moonlight for this WireGuard change to take effect. Add your PC manually using the same IPv4 address.",
+            "status": "WireGuard status (click to refresh)",
+            "target_address": "PC IPv4 address behind the router",
+            "target_address_hint": "Enter the PC's literal IPv4 address, for example 192.168.1.100",
+            "title": "WireGuard"
+        },
         "zero_threads": "0 (No use threads)"
     },
     "streaming": {

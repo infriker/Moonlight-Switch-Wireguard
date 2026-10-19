@@ -1,0 +1,34 @@
+name: WireGuard portable tests
+
+on:
+  push:
+    paths:
+      - "app/src/vpn/**"
+      - "tests/**"
+      - "cmake/WireGuard.cmake"
+      - "CMakeLists.txt"
+      - ".github/workflows/wireguard-tests.yml"
+  pull_request:
+    paths:
+      - "app/src/vpn/**"
+      - "tests/**"
+      - "cmake/WireGuard.cmake"
+      - "CMakeLists.txt"
+      - ".github/workflows/wireguard-tests.yml"
+  workflow_dispatch:
+
+jobs:
+  portable-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure portable tests
+        run: cmake -S tests -B build/wireguard-tests
+
+      - name: Build portable tests
+        run: cmake --build build/wireguard-tests --parallel 2
+
+      - name: Run portable tests
+        run: ctest --test-dir build/wireguard-tests --output-on-failure

@@ -1,5 +1,6 @@
 #include "GameStreamClient.hpp"
 #include "Settings.hpp"
+#include "vpn/WireGuardManager.hpp"
 #include "WakeOnLanManager.hpp"
 #include <borealis.hpp>
 #include <algorithm>
@@ -321,6 +322,11 @@ static uint32_t get_my_ip_address() {
 }
 
 std::vector<std::string> GameStreamClient::host_addresses_for_find() {
+    auto& vpn = moonlight::vpn::WireGuardManager::instance();
+    if (vpn.enabled()) {
+        return vpn.targetAddress().empty() ? std::vector<std::string>{}
+                                          : std::vector<std::string>{vpn.targetAddress()};
+    }
     std::vector<std::string> addresses;
 
     uint32_t address = get_my_ip_address();
@@ -345,6 +351,7 @@ std::vector<std::string> GameStreamClient::host_addresses_for_find() {
 }
 
 std::string GameStreamClient::external_address_for_mdns(const std::string& address) {
+    if (moonlight::vpn::WireGuardManager::instance().enabled()) return "";
     const auto localAddress = strip_ipv4_port(address);
     if (!localAddress.empty() && !is_ipv4_address(localAddress)) {
         return "";
@@ -377,6 +384,7 @@ std::string GameStreamClient::external_address_for_mdns(const std::string& addre
 }
 
 bool GameStreamClient::can_find_host() {
+    if (moonlight::vpn::WireGuardManager::instance().enabled()) return false;
 #if defined(PLATFORM_IOS) || defined(PLATFORM_TVOS) || defined(PLATFORM_VISIONOS)
     return true;
 #else
@@ -427,6 +435,10 @@ static int mdns_discovery_callback(int sock, const struct sockaddr* from, size_t
 }
 
 void GameStreamClient::find_hosts(ServerCallback<std::vector<Host>>& callback) {
+    if (moonlight::vpn::WireGuardManager::instance().enabled()) {
+        callback(GSResult<std::vector<Host>>::success({}));
+        return;
+    }
     const uint64_t generation = ++findHostsGeneration;
     brls::async([callback, generation] {
         auto isCancelled = [generation]() {
@@ -529,11 +541,16 @@ void GameStreamClient::cancel_find_hosts() {
 #endif
 
 bool GameStreamClient::can_wake_up_host(const Host& host) {
+    if (moonlight::vpn::WireGuardManager::instance().enabled()) return false;
     return WakeOnLanManager::can_wake_up_host(host);
 }
 
 void GameStreamClient::wake_up_host(const Host& host,
                                     ServerCallback<bool>& callback) {
+    if (moonlight::vpn::WireGuardManager::instance().enabled()) {
+        callback(GSResult<bool>::failure("Wake-on-LAN is not routed through the in-app WireGuard tunnel. Wake the PC using your router."));
+        return;
+    }
     brls::async([host, callback] {
         auto result = WakeOnLanManager::wake_up_host(host);
         if (!result.isSuccess()) {

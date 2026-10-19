@@ -70,6 +70,7 @@ class MoonlightSession {
     static void audio_renderer_decode_and_play_sample(char*, int);
 
     std::string m_address;
+    std::string m_vpn_rtsp_url;
     int m_app_id;
     bool m_is_sunshine = false;
     STREAM_CONFIGURATION m_config;

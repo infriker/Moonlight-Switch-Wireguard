@@ -3,6 +3,7 @@
 #include "GameStreamClient.hpp"
 #include "InputManager.hpp"
 #include "Settings.hpp"
+#include "vpn/WireGuardManager.hpp"
 #include "borealis.hpp"
 #include <string.h>
 
@@ -284,6 +285,11 @@ void MoonlightSession::start(ServerCallback<bool> callback, bool is_sunshine) {
     m_config.audioConfiguration = AUDIO_CONFIGURATION_STEREO;
     m_config.packetSize = 1392;
     m_config.streamingRemotely = STREAM_CFG_AUTO;
+    if (moonlight::vpn::WireGuardManager::instance().enabled()) {
+        // Loopback is the local relay, not the actual network path to the PC.
+        m_config.streamingRemotely = STREAM_CFG_REMOTE;
+        m_config.packetSize = moonlight::vpn::WireGuardManager::instance().packetSize();
+    }
     m_config.bitrate = Settings::instance().bitrate();
     m_config.encryptionFlags = m_is_sunshine ? ENCFLG_ALL : ENCFLG_VIDEO;
 
@@ -347,6 +353,19 @@ void MoonlightSession::start(ServerCallback<bool> callback, bool is_sunshine) {
                 brls::async([this, callback]() mutable {
                     auto m_data =
                         GameStreamClient::instance().server_data(m_address);
+
+                    auto& vpn = moonlight::vpn::WireGuardManager::instance();
+                    if (vpn.enabled()) {
+                        std::string error;
+                        if (!vpn.prepareStream(m_address, m_data.serverInfo.rtspSessionUrl,
+                                               m_vpn_rtsp_url, m_config.packetSize, error)) {
+                            callback(GSResult<bool>::failure(error));
+                            return;
+                        }
+                        m_data.serverInfo.address = "127.0.0.1";
+                        m_data.serverInfo.rtspSessionUrl = m_vpn_rtsp_url.empty() ? nullptr : m_vpn_rtsp_url.c_str();
+                        m_config.streamingRemotely = STREAM_CFG_REMOTE;
+                    }
 
                     int result = LiStartConnection(
                         &m_data.serverInfo, &m_config, &m_connection_callbacks,
