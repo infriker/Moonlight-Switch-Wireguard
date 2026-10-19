@@ -9,9 +9,13 @@ a WireGuard router. Put your Switch peer profile on the SD card, configure its
 path and the PC address in Settings, enable WireGuard, and restart Moonlight.
 Pairing, game lists, video, audio and input use the tunnel; no additional
 Switch VPN sysmodule is required. The initial implementation supports one peer,
-one PC and standard GameStream ports. It needs validation on a real Switch.
+one PC and standard GameStream ports. A real Switch has connected through the
+tunnel and loaded the Sunshine game list; extended streaming and recovery tests
+are still pending.
 
-See [WireGuard setup, build and limitations](docs/WIREGUARD.md).
+Download the [WireGuard preview release](https://github.com/infriker/Moonlight-Switch-Wireguard/releases/tag/wireguard-v0.1.0)
+(`Moonlight-WireGuard.nro`). See the [setup and troubleshooting guide in Russian](docs/WIREGUARD.md)
+for router rules, PC address configuration, session controls and 720p display setup.
 
 ## Screenshots
 <details>
@@ -27,12 +31,14 @@ See [WireGuard setup, build and limitations](docs/WIREGUARD.md).
 
 # Installing
 ### Switch
-1. Download latest Moonlight-Switch [release](https://github.com/XITRIX/Moonlight-Switch/releases).
-2. Put Moonlight.nro to sdcard:/switch/Moonlight-Switch;
+1. Download `Moonlight-WireGuard.nro` from this fork's [WireGuard release](https://github.com/infriker/Moonlight-Switch-Wireguard/releases/tag/wireguard-v0.1.0).
+2. Put `Moonlight-WireGuard.nro` in `sdcard:/switch/Moonlight-Switch/`;
 3. Launch hbmenu over *Title Redirection* (for FULL RAM access);
 4. Launch moonlight.
 
-Or download it from [HB App Store](https://apps.fortheusers.org/switch/Moonlight-Switch)
+The original client is also available from [upstream releases](https://github.com/XITRIX/Moonlight-Switch/releases)
+and [HB App Store](https://apps.fortheusers.org/switch/Moonlight-Switch). Use this fork's `.nro`
+for the WireGuard support described here.
 
 > [!TIP]
 > To be able to use high bitrate setting especially with 1080p - resolution, you need to overclock CPU/GPU of your console.

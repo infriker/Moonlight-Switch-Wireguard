@@ -3,6 +3,14 @@
 Base fork revision: `a75fee2` (`Linux GH Actions`). Implementation branch:
 `feature/in-app-wireguard`.
 
+The published `Moonlight-WireGuard.nro` was built from the implementation in
+`d4babaad379e9c407933cc08b71f12fa6c197998`. The release also includes subsequent
+documentation updates; they do not change the executable. SHA-256:
+
+```text
+7e3513ba2aae00338e2f39f0d7e80c9f686f580ca8d6857cc3bfa13587f1b213
+```
+
 ## Completed
 
 - Three portable CTest targets passed: configuration parsing, HTTP/RTSP route
@@ -24,13 +32,27 @@ Base fork revision: `a75fee2` (`Linux GH Actions`). Implementation branch:
 - Static review covered TCP buffering/partial writes, pbuf ownership, TCP close
   callbacks, rekey locking, HTTP route rejection and tunnel shutdown order.
 
-## Not established by these checks
+## Subsequent device checks
 
-No console, router, user profile or production Sunshine host was contacted.
-Handshake interoperability, pairing, video/audio/controller behavior, bitrate,
+- The router showed a successful WireGuard handshake for the separate Switch
+  peer.
+- The user confirmed that the already-paired Switch could connect to Sunshine
+  and load its game list with WireGuard enabled after router firewall rules were
+  added for the Switch's VPN address. Before that change, the handshake succeeded
+  while the PC connection timed out.
+- Direct LAN access with WireGuard disabled also worked. A fresh PIN pairing over
+  WireGuard was not tested because the client was already paired.
+
+These observations establish the handshake and application-list path for one
+setup. They do not replace the broader console checklist in
+[`WIREGUARD.md`](WIREGUARD.md).
+
+## Still to validate
+
+External-network streaming, sustained video/audio/controller behavior, bitrate,
 latency, reconnect after network interruption, sleep/resume and prolonged rekey
-behavior remain hardware test requirements. A successful build does not prove
-those behaviors. See the console checklist in [`WIREGUARD.md`](WIREGUARD.md).
+behavior still need systematic hardware tests. The release is marked as a
+prerelease. Compilation and portable tests alone do not establish these behaviors.
 
 This version supports one IPv4 peer and one PC on standard GameStream ports.
 DNS names for the WireGuard endpoint use the system resolver; slow DNS may delay
